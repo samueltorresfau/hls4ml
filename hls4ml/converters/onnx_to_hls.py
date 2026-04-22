@@ -63,6 +63,9 @@ def get_input_shape(graph, node):
     """
     rv = []
     for inp in node.input:
+        # Check for empty optional inputs (e.g., GRU) and skip
+        if not inp:
+            continue
         # first try regular variables
         vals = [x for x in graph.value_info if x.name == inp]
         if not vals:
@@ -77,6 +80,33 @@ def get_input_shape(graph, node):
         if dim:
             rv.append(dim)
     return rv
+
+
+def get_tensor_shape(graph, tensor_name):
+    """Return the shape of the tensor with name tensor_name
+
+    Arguments:
+        graph:  the onnx graph
+        tensor_name:  the name of the tensor for which the shape is desired
+
+    Returns:
+        list: The shape of the tensor
+
+    Raises:
+        RuntimeError:  If the tensor name is not found in the graph
+    """
+    vals = [x for x in graph.value_info if x.name == tensor_name]
+    if not vals:
+        vals = [x for x in graph.output if x.name == tensor_name]
+    if not vals:
+        vals = [x for x in graph.input if x.name == tensor_name]
+    if not vals:
+        tensor = next((x for x in graph.initializer if x.name == tensor_name), None)
+        if tensor is not None:
+            return list(tensor.dims)
+        raise RuntimeError(f'Could not find the shape for tensor {tensor_name}')
+
+    return list(d.dim_value for d in vals[0].type.tensor_type.shape.dim)
 
 
 def get_constant_value(graph, constant_name):
@@ -137,6 +167,65 @@ def compute_pads_2d(operation, layer):
     return pads
 
 
+def _node_identifier(node):
+    if node.name:
+        return node.name
+
+    return f'{node.op_type}:{"|".join(node.output)}'
+
+
+class OnnxGraphContext:
+    """A helper class to manage the ONNX graph and provide easier access to producers,
+    consumers, initializers, etc."""
+
+    def __init__(self, graph):
+        self.graph = graph
+        self.initializers = {initializer.name: initializer for initializer in graph.initializer}
+        self.input_names = {inp.name for inp in graph.input}
+        self.output_names = [out.name for out in graph.output]
+        self.node_by_output = {}
+        self.consumers = {}
+        self.consumed_nodes = set()
+
+        for node in graph.node:
+            for output in node.output:
+                self.node_by_output[output] = node
+            for inp in node.input:
+                if inp:
+                    self.consumers.setdefault(inp, []).append(node)
+
+    def __getattr__(self, name):
+        return getattr(self.graph, name)
+
+    def is_initializer(self, name):
+        return name in self.initializers
+
+    def is_graph_input(self, name):
+        return name in self.input_names
+
+    def is_graph_output(self, name):
+        return name in self.output_names
+
+    def get_producer(self, tensor_name):
+        return self.node_by_output.get(tensor_name)
+
+    def get_consumers(self, tensor_name):
+        return self.consumers.get(tensor_name, [])
+
+    def get_single_consumer(self, tensor_name):
+        consumers = self.get_consumers(tensor_name)
+        if len(consumers) != 1:
+            return None
+
+        return consumers[0]
+
+    def mark_consumed(self, node):
+        self.consumed_nodes.add(_node_identifier(node))
+
+    def is_consumed(self, node):
+        return _node_identifier(node) in self.consumed_nodes
+
+
 # ----------------------Layer handling---------------------
 layer_handlers = {}
 
@@ -160,13 +249,61 @@ def onnx_handler(*args):
     return decorator
 
 
-def get_out_layer_name(graph):
+def get_out_layer_names_from_layer_list(graph, layer_list):
+    remaining_outputs = set(graph.output_names)
+    output_layers = []
+
+    for layer in layer_list:
+        layer_outputs = set(layer.get('outputs', [layer['name']]))
+        if layer_outputs & remaining_outputs:
+            output_layers.append(layer['name'])
+            remaining_outputs -= layer_outputs
+
+    if remaining_outputs:
+        missing_outputs = ', '.join(sorted(remaining_outputs))
+        raise RuntimeError(f'Could not find the output layer for output tensor(s) {missing_outputs}')
+
+    return output_layers
+
+
+def get_constant_layers(graph, layer_list):
+    referenced_constants = {output_name for output_name in graph.output_names if graph.is_initializer(output_name)}
+
+    for layer in layer_list:
+        for input_name in layer.get('inputs', []):
+            if graph.is_initializer(input_name):
+                referenced_constants.add(input_name)
+
+    constant_layers = []
+    for constant_name in graph.initializers:
+        if constant_name not in referenced_constants:
+            continue
+
+        constant_layer = {}
+        constant_layer['name'] = replace_char_inconsitency(constant_name)
+        constant_layer['class_name'] = 'Constant'
+        constant_layer['outputs'] = [constant_name]
+        constant_layer['value'] = get_constant_value(graph, constant_name)
+
+        sanitize_layer_name(constant_layer)
+        constant_layers.append(constant_layer)
+
+    return constant_layers
+
+
+def is_onnx_recurrent_input_wrapper(node, graph):
+    """Checks for the common pattern of a transpose wrapper around recurrent layers,
+    (batch-first vs sequence-first).
     """
-    Get the output layer's name for the model.
-    graph.output only returns the output's node index
-    """
-    output_index_list = [x.name for x in graph.output]
-    return [node.name for node in graph.node if node.output[0] in output_index_list]
+    if node.op_type != 'Transpose' or len(node.output) != 1:
+        return False
+
+    consumer = graph.get_single_consumer(node.output[0])
+    if consumer is None or consumer.op_type not in ('GRU', 'LSTM', 'RNN'):
+        return False
+
+    perm = list(get_onnx_attribute(node, 'perm', []))
+    return perm == [1, 0, 2]
 
 
 def parse_onnx_model(onnx_model):
@@ -183,25 +320,23 @@ def parse_onnx_model(onnx_model):
         input_layers (list):  The input layers
         output_layers (list):  The output layers
     """
-    # This is a list of dictionaries to hold all the layer info we need to generate HLS
-    layer_list = []
+    input_layer_list = []
+    parsed_layers = []
+    graph = OnnxGraphContext(onnx_model.graph)
 
     # We don't infer the shapes because the qonnx package preprocessing does it.
 
     # Obtain list of input/ouput layers
-    all_inputs = [x.name for x in onnx_model.graph.input]
-    all_initializers = [x.name for x in onnx_model.graph.initializer]
+    all_inputs = [x.name for x in graph.input]
+    all_initializers = list(graph.initializers)
     input_layers = [x for x in all_inputs if x not in all_initializers]
-    constant_layers = all_initializers  # no need to copy it even though we change it
-    output_layers = get_out_layer_name(onnx_model.graph)
 
-    print('Output layers: ', output_layers)
-
+    # First build the input layers
     for i, inp in enumerate(input_layers):
         input_layer = {}
         input_layer['name'] = replace_char_inconsitency(inp)
         input_layer['class_name'] = 'InputLayer'
-        inp_shape = get_global_input_shape(onnx_model.graph, inp)
+        inp_shape = get_global_input_shape(graph, inp)
         # We only support ONNX where the first dimension is the batch dimension.
         # Remove the batch dimension in all subsequnt use
         input_layer['input_shape'] = inp_shape[1:]
@@ -211,19 +346,7 @@ def parse_onnx_model(onnx_model):
         sanitize_layer_name(input_layer)
         input_layers[i] = input_layer['name']
 
-        layer_list.append(input_layer)
-
-    for i, constant in enumerate(constant_layers):
-        constant_layer = {}
-        constant_layer['name'] = replace_char_inconsitency(constant)
-        constant_layer['class_name'] = 'Constant'
-        constant_layer['value'] = get_constant_value(onnx_model.graph, constant)
-
-        # Clean the layer name for specific models
-        sanitize_layer_name(constant_layer)
-        constant_layers[i] = constant_layer['name']
-
-        layer_list.append(constant_layer)
+        input_layer_list.append(input_layer)
 
     # Defined supported layers and check for unsupported layer type
     skip_layers = ['Dropout', 'Identity']
@@ -233,14 +356,22 @@ def parse_onnx_model(onnx_model):
 
     supported_layers = get_supported_onnx_layers() + skip_layers
 
+    # Parse the graph operators in topological order
     print('Topology:')
-    for node in onnx_model.graph.node:
+    for node in graph.node:
+        if graph.is_consumed(node):
+            'Node has already been consumed as part of a layer handler, skipping.'
+            continue
+        if is_onnx_recurrent_input_wrapper(node, graph):
+            'Node is a recurrent input wrapper, skipping.'
+            continue
+
         if node.op_type not in supported_layers:
             raise Exception(f'ERROR: Unsupported operation type: {node.op_type}')
 
         # Note that at this point, input shape still contains batch dimension
         # in cases where it appears. That is not filtered out till later.
-        input_shapes = get_input_shape(onnx_model.graph, node)
+        input_shapes = get_input_shape(graph, node)
 
         if node.op_type in skip_layers:
             # Currently supported skipped layers have only one input and output
@@ -255,11 +386,19 @@ def parse_onnx_model(onnx_model):
         input_names = [inputs_map.get(x, x) for x in node.input]
 
         # Process the layer
-        layer = layer_handlers[node.op_type](node, input_names, input_shapes, onnx_model.graph)
+        layer = layer_handlers[node.op_type](node, input_names, input_shapes, graph)
 
         sanitize_layer_name(layer)
         print(f'Layer name: {layer["name"]}, layer type: {layer["class_name"]}, current shape: {input_shapes}')
-        layer_list.append(layer)
+        parsed_layers.append(layer)
+
+    # Parse constant layers
+    constant_layers = get_constant_layers(graph, parsed_layers)
+    layer_list = input_layer_list + constant_layers + parsed_layers
+
+    # Parse output layer(s)
+    output_layers = get_out_layer_names_from_layer_list(graph, layer_list)
+    print('Output layers: ', output_layers)
 
     return layer_list, input_layers, output_layers
 
