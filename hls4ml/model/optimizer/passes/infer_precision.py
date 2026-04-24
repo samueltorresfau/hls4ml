@@ -564,7 +564,21 @@ class InferPrecisionTypes(ConfigurableOptimizerPass):
 
         for weightvar in rnn_weights:
             if f'{weightvar}_t' in types_to_infer:
-                self._infer_default_type(node, f'{weightvar}_t')
+                quantizer = None
+                if node.class_name != 'Bidirectional':
+                    if weightvar == 'weight':
+                        quantizer = node.get_attr('weight_quantizer', None)
+                    elif weightvar == 'recurrent_weight':
+                        quantizer = node.get_attr('recurrent_weight_quantizer', None)
+                    elif weightvar in ('bias', 'recurrent_bias'):
+                        quantizer = node.get_attr('bias_quantizer', None)
+
+                if quantizer is not None:
+                    node.types[f'{weightvar}_t'].name = node.name + f'_{weightvar}_t'
+                    node.types[f'{weightvar}_t'].precision = quantizer.hls_type
+                else:
+                    self._infer_default_type(node, f'{weightvar}_t')
+
                 node.weights[weightvar].update_precision(node.types[f'{weightvar}_t'].precision)
                 inferred_types.append(f'{weightvar}_t')
 

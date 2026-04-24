@@ -1356,15 +1356,17 @@ class SimpleRNN(Layer):
             )
 
         # weights
-        self.add_weights()
+        self.add_weights(quantizer=self.get_attr('weight_quantizer'))
 
         # recurrent weights
-        self.add_weights_variable(name='recurrent_weight', var_name='wr{index}')
+        self.add_weights_variable(
+            name='recurrent_weight', var_name='wr{index}', quantizer=self.get_attr('recurrent_weight_quantizer')
+        )
 
         # biases
-        self.add_weights_variable(name='bias', var_name='b{index}')
+        self.add_weights_variable(name='bias', var_name='b{index}', quantizer=self.get_attr('bias_quantizer'))
         if 'pytorch' in self.attributes.keys():
-            self.add_weights_variable(name='recurrent_bias', var_name='br{index}')
+            self.add_weights_variable(name='recurrent_bias', var_name='br{index}', quantizer=self.get_attr('bias_quantizer'))
 
 
 class LSTM(Layer):
@@ -1406,20 +1408,27 @@ class LSTM(Layer):
             )
 
         # weights
-        self.add_weights()
+        self.add_weights(quantizer=self.get_attr('weight_quantizer'))
 
         # recurrent weights
         recurrent_weight = self.get_attr('recurrent_weight_data')
-        self.add_weights_variable(name='recurrent_weight', var_name='wr{index}', data=recurrent_weight)
+        self.add_weights_variable(
+            name='recurrent_weight',
+            var_name='wr{index}',
+            data=recurrent_weight,
+            quantizer=self.get_attr('recurrent_weight_quantizer'),
+        )
 
         # biases
-        self.add_weights_variable(name='bias', var_name='b{index}')
+        self.add_weights_variable(name='bias', var_name='b{index}', quantizer=self.get_attr('bias_quantizer'))
 
         if 'pytorch' in self.attributes.keys():
-            self.add_weights_variable(name='recurrent_bias', var_name='br{index}')
+            self.add_weights_variable(name='recurrent_bias', var_name='br{index}', quantizer=self.get_attr('bias_quantizer'))
         else:
             recurrent_bias = np.zeros(recurrent_weight.shape[1])
-            self.add_weights_variable(name='recurrent_bias', var_name='br{index}', data=recurrent_bias)
+            self.add_weights_variable(
+                name='recurrent_bias', var_name='br{index}', data=recurrent_bias, quantizer=self.get_attr('bias_quantizer')
+            )
 
 
 class GRU(Layer):
@@ -1462,14 +1471,16 @@ class GRU(Layer):
             )
 
         # weights
-        self.add_weights()
+        self.add_weights(quantizer=self.get_attr('weight_quantizer'))
 
         # recurrent weights
-        self.add_weights_variable(name='recurrent_weight', var_name='wr{index}')
+        self.add_weights_variable(
+            name='recurrent_weight', var_name='wr{index}', quantizer=self.get_attr('recurrent_weight_quantizer')
+        )
 
         # biases
-        self.add_weights_variable(name='bias', var_name='b{index}')
-        self.add_weights_variable(name='recurrent_bias', var_name='br{index}')
+        self.add_weights_variable(name='bias', var_name='b{index}', quantizer=self.get_attr('bias_quantizer'))
+        self.add_weights_variable(name='recurrent_bias', var_name='br{index}', quantizer=self.get_attr('bias_quantizer'))
 
 
 class TimeDistributed(Layer):

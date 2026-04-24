@@ -4,18 +4,16 @@ from hls4ml.utils.dependency import requires
 
 # ----------------------Helpers---------------------
 def sanitize_layer_name(layer):
-    new_name = layer['name']
+    new_name = replace_char_inconsistency(layer['name'])
     if new_name[0].isdigit():
         new_name = layer['class_name'].lower() + new_name
 
     layer['name'] = new_name
 
 
-def replace_char_inconsitency(name):
-    """
-    Replace some inconsistent characters that cause issues when writing into HLS.
-    """
-    return name.replace('.', '_')
+def replace_char_inconsistency(name):
+    """Replace some inconsistent characters that cause issues when writing into HLS"""
+    return name.replace('.', '_').replace('/', '_').replace('::', '_').replace(':', '_')
 
 
 def get_onnx_attribute(operation, name, default=None):
@@ -75,6 +73,11 @@ def get_input_shape(graph, node):
             # then try global input.
             vals = [x for x in graph.input if x.name == inp]
         if not vals:
+            # Lastly, try initializers (constants)
+            tensor = next((x for x in graph.initializer if x.name == inp), None)
+            if tensor is not None:
+                rv.append(list(tensor.dims))
+                continue
             raise RuntimeError(f'Could not find the shape for input {inp}')
         dim = list(d.dim_value for d in vals[0].type.tensor_type.shape.dim)
         if dim:
@@ -186,6 +189,8 @@ class OnnxGraphContext:
         self.node_by_output = {}
         self.consumers = {}
         self.consumed_nodes = set()
+        self.ignored_outputs = set()
+        self.input_shape_overrides = {}
 
         for node in graph.node:
             for output in node.output:
@@ -225,6 +230,15 @@ class OnnxGraphContext:
     def is_consumed(self, node):
         return _node_identifier(node) in self.consumed_nodes
 
+    def ignore_output(self, output_name):
+        self.ignored_outputs.add(output_name)
+
+    def set_input_shape_override(self, input_name, shape):
+        self.input_shape_overrides[input_name] = shape
+
+    def get_input_shape_override(self, input_name):
+        return self.input_shape_overrides.get(input_name)
+
 
 # ----------------------Layer handling---------------------
 layer_handlers = {}
@@ -250,7 +264,7 @@ def onnx_handler(*args):
 
 
 def get_out_layer_names_from_layer_list(graph, layer_list):
-    remaining_outputs = set(graph.output_names)
+    remaining_outputs = set(graph.output_names) - graph.ignored_outputs
     output_layers = []
 
     for layer in layer_list:
@@ -280,7 +294,7 @@ def get_constant_layers(graph, layer_list):
             continue
 
         constant_layer = {}
-        constant_layer['name'] = replace_char_inconsitency(constant_name)
+        constant_layer['name'] = replace_char_inconsistency(constant_name)
         constant_layer['class_name'] = 'Constant'
         constant_layer['outputs'] = [constant_name]
         constant_layer['value'] = get_constant_value(graph, constant_name)
@@ -306,6 +320,42 @@ def is_onnx_recurrent_input_wrapper(node, graph):
     return perm == [1, 0, 2]
 
 
+def is_qonnx_quant_rnn_parameter_quant(node, graph):
+    """Skip constant parameter Quant nodes consumed by a quantized recursive cell (e.g., QuantGRUCell).."""
+    if node.op_type not in ('Quant', 'IntQuant') or len(node.output) != 1:
+        return False
+
+    consumer = graph.get_single_consumer(node.output[0])
+    if consumer is None or consumer.op_type != 'QuantGRUCell':
+        return False
+
+    return node.output[0] != consumer.input[0]
+
+
+def apply_qonnx_quant_gru_input_overrides(graph):
+    """Expose raw time-major QuantGRUCell exports through a batch-first user interface."""
+    for node in graph.node:
+        if node.op_type != 'QuantGRUCell' or not node.input:
+            continue
+
+        if get_onnx_attribute(node, 'batch_first', 0) != 0:
+            continue
+
+        input_quant = graph.get_producer(node.input[0])
+        if input_quant is None or input_quant.op_type not in ('Quant', 'IntQuant'):
+            continue
+
+        input_name = input_quant.input[0]
+        if not graph.is_graph_input(input_name):
+            continue
+
+        input_shape = get_global_input_shape(graph, input_name)
+        if len(input_shape) != 3:
+            continue
+
+        graph.set_input_shape_override(input_name, [input_shape[1], input_shape[0], input_shape[2]])
+
+
 def parse_onnx_model(onnx_model):
     """Parses the onnx model, both for configuration building and general processing.
 
@@ -323,6 +373,8 @@ def parse_onnx_model(onnx_model):
     input_layer_list = []
     parsed_layers = []
     graph = OnnxGraphContext(onnx_model.graph)
+    apply_qonnx_quant_gru_input_overrides(graph)
+    inputs_map = {}
 
     # We don't infer the shapes because the qonnx package preprocessing does it.
 
@@ -334,9 +386,9 @@ def parse_onnx_model(onnx_model):
     # First build the input layers
     for i, inp in enumerate(input_layers):
         input_layer = {}
-        input_layer['name'] = replace_char_inconsitency(inp)
+        input_layer['name'] = replace_char_inconsistency(inp)
         input_layer['class_name'] = 'InputLayer'
-        inp_shape = get_global_input_shape(graph, inp)
+        inp_shape = graph.get_input_shape_override(inp) or get_global_input_shape(graph, inp)
         # We only support ONNX where the first dimension is the batch dimension.
         # Remove the batch dimension in all subsequnt use
         input_layer['input_shape'] = inp_shape[1:]
@@ -345,6 +397,7 @@ def parse_onnx_model(onnx_model):
         # Clean the layer name for specific models
         sanitize_layer_name(input_layer)
         input_layers[i] = input_layer['name']
+        inputs_map[inp] = input_layer['name']
 
         input_layer_list.append(input_layer)
 
@@ -352,8 +405,6 @@ def parse_onnx_model(onnx_model):
     skip_layers = ['Dropout', 'Identity']
 
     # Map inputs of skipped layers
-    inputs_map = {}
-
     supported_layers = get_supported_onnx_layers() + skip_layers
 
     # Parse the graph operators in topological order
@@ -364,6 +415,9 @@ def parse_onnx_model(onnx_model):
             continue
         if is_onnx_recurrent_input_wrapper(node, graph):
             'Node is a recurrent input wrapper, skipping.'
+            continue
+        if is_qonnx_quant_rnn_parameter_quant(node, graph):
+            'Node is a quantized recursive cell parameter quantizer, skipping.'
             continue
 
         if node.op_type not in supported_layers:
